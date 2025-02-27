@@ -5,17 +5,19 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.utils.markdown import hbold, hlink
-from main import collect_data
-import os
+from main1 import collect_data
+import environ
 import time
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-bot = Bot(token=os.getenv("TOKEN"),
+env = environ.Env()
+environ.Env.read_env()
+bot = Bot(env("TOKEN"),
           default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 schedular = AsyncIOScheduler()
 
-chat_id = os.getenv("CHAT")
+chat_id = env("CHAT")
 async def update_new_ad():
     collect_data()
 
@@ -30,7 +32,7 @@ async def update_new_ad():
             if index % 5 == 0:
                 time.sleep(3)
 
-            await bot.send_message(chat_id, card)
+            await bot.send_message("CHAT", card)
         else:
             prev_items = items
 
