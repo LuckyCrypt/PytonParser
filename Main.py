@@ -122,7 +122,7 @@ class DatabaseManager:
 db = DatabaseManager(DB_CONFIG)
 
 
-def retry(retries=3, delay=1):
+def retry(retries=2, delay=1):
     """Декоратор для повторных попыток."""
 
     def decorator(func):
@@ -189,13 +189,14 @@ def save_items_to_db(items):
 def parse_elements(sb):
     """Парсинг текущей страницы."""
     items = []
+    sb.sleep(10)  # Важно давать паузу
     # Используем более надежные селекторы Avito
     listings = sb.find_elements('div[data-marker="item"]')
 
     for listing in listings:
         try:
             # Используем вложенный поиск внутри элемента
-            name_el = listing.find_element(By.CSS_SELECTOR, '[data-marker="item-title"]')
+            name_el = listing.find_element(By.CSS_SELECTOR, 'h2[itemprop="name"]')
             price_el = listing.find_element(By.CSS_SELECTOR, '[itemprop="price"]')
             req_el = listing.find_element(By.CSS_SELECTOR, '[data-marker="item-specific-params"]')
 
@@ -229,7 +230,7 @@ def collect_data_apartments():
             # Нажимаем кнопку поиска
             if sb.is_element_visible('button[data-marker="search-filters/submit-button"]'):
                 sb.click('button[data-marker="search-filters/submit-button"]')
-                sb.sleep(2)
+                sb.sleep(5)
 
             # Цикл по страницам пагинации
             page = 1
@@ -243,7 +244,7 @@ def collect_data_apartments():
                 next_button = 'a[data-marker="pagination-button/nextPage"]'
                 if sb.is_element_visible(next_button):
                     sb.click(next_button)
-                    sb.sleep(3)  # Важно давать паузу
+                    sb.sleep(6)  # Важно давать паузу
                     page += 1
                 else:
                     break
