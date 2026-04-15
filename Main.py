@@ -1,262 +1,262 @@
 import logging
-import time
-import json
 import datetime as dt
-from idlelib.autocomplete import TRY_A
+import time
+from contextlib import contextmanager
+
 import psycopg2
-from fake_useragent import UserAgent
+from psycopg2 import pool
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from seleniumbase import SB
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from fake_useragent import UserAgent
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s',
-                    filename='avito_scraper.log')
+# --- КОНФИГУРАЦИЯ ---
+DB_CONFIG = {
+    "dbname": "postgres",
+    "user": "postgres",
+    "password": "2028",
+    "host": "localhost",
+    "port": "5432"
+}
 
-def retry(func, retries=3, delay=1):
-    """Декоратор для повторных попыток выполнения функции."""
-    def wrapper(*args, **kwargs):
-        nonlocal delay  # Указываем, что delay - не локальная переменная
-        for attempt in range(retries):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                logging.error(f"Attempt {attempt+1} failed in {func.__name__}: {e}")
-                time.sleep(delay)
-                delay *= 2  # Экспоненциальная задержка
-        logging.error(f"Function {func.__name__} failed after {retries} attempts.")
-        return None  # Или raise исключение, если нужно
-    return wrapper
+# Настройка логирования в файл
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='avito_scraper.log'
+)
 
-def findcase(page_source, marker):
-    """Находит подстроку, содержащую указанный маркер."""
+class DatabaseManager:
+    def __init__(self, config):
+        try:
+            self.pool = psycopg2.pool.SimpleConnectionPool(1, 10, **config)
+            self._init_migrations_table() # Создаем таблицу для учета миграций
+            self.apply_migrations()       # Запускаем сами миграции
+        except Exception as e:
+            logging.error(f"Could not initialize DB: {e}")
+            raise
+
+    @contextmanager
+    def get_cursor(self):
+        conn = self.pool.getconn()
+        conn.autocommit = True
+        try:
+            yield conn.cursor()
+        finally:
+            self.pool.putconn(conn)
+
+    def _init_migrations_table(self):
+        """Создает служебную таблицу для хранения примененных миграций."""
+        query = """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        with self.get_cursor() as cur:
+            cur.execute(query)
+
+    def apply_migrations(self):
+        """Список всех изменений в базе данных."""
+        # Ключ — номер версии, Значение — список SQL-команд
+        migrations = {
+            1: [ # Начальное создание таблиц
+                """
+                CREATE TABLE IF NOT EXISTS logs (
+                    id SERIAL PRIMARY KEY,
+                    Date TIMESTAMP,
+                    Users INTEGER,
+                    Messages TEXT
+                )""",
+                """
+                CREATE TABLE IF NOT EXISTS history (
+                    id SERIAL PRIMARY KEY,
+                    Date TIMESTAMP,
+                    Users INTEGER
+                )""",
+                """
+                CREATE TABLE IF NOT EXISTS apartmentsAvito (
+                    id SERIAL PRIMARY KEY,
+                    DateScan TIMESTAMP,
+                    name TEXT,
+                    url TEXT,
+                    price TEXT,
+                    requirement TEXT,
+                    active BOOLEAN DEFAULT TRUE,
+                    apartmentsID VARCHAR(50) UNIQUE
+                )"""
+            ],
+            2: [ # Пример будущей миграции: добавим индекс для ускорения поиска
+                "CREATE INDEX IF NOT EXISTS idx_apartments_id ON apartmentsAvito(apartmentsID)"
+            ],
+            # 3: ["ALTER TABLE apartmentsAvito ADD COLUMN city TEXT"] # Так можно добавлять колонки позже
+        }
+
+        with self.get_cursor() as cur:
+            # Узнаем текущую версию БД
+            cur.execute("SELECT MAX(version) FROM schema_migrations")
+            result = cur.fetchone()
+            current_version = result[0] if result[0] is not None else 0
+
+            # Применяем миграции, которые еще не были запущены
+            for version in sorted(migrations.keys()):
+                if version > current_version:
+                    logging.info(f"Applying migration version {version}...")
+                    try:
+                        for sql in migrations[version]:
+                            cur.execute(sql)
+                        cur.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
+                        logging.info(f"Migration {version} applied successfully.")
+                    except Exception as e:
+                        logging.error(f"Error applying migration {version}: {e}")
+                        raise
+
+    def log_to_db(self, message, user_id=1):
+        query = "INSERT INTO logs (Date, Users, Messages) VALUES (%s, %s, %s)"
+        try:
+            with self.get_cursor() as cur:
+                cur.execute(query, (dt.datetime.now(), user_id, message))
+        except Exception as e:
+            logging.error(f"Failed to write log to DB: {e}")
+
+
+db = DatabaseManager(DB_CONFIG)
+
+
+def retry(retries=3, delay=1):
+    """Декоратор для повторных попыток."""
+
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            current_delay = delay
+            for attempt in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    logging.error(f"Attempt {attempt + 1} failed in {func.__name__}: {e}")
+                    if attempt == retries - 1:
+                        db.log_to_db(f"Error in {func.__name__}: {str(e)}")
+                        return None
+                    time.sleep(current_delay)
+                    current_delay *= 2
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+def extract_case(page_source, marker):
+    """Безопасный поиск маркеров в исходном коде."""
     try:
         start = page_source.find(marker)
         if start == -1:
-            return None  # Маркер не найден
-        end = page_source.find("\"", start)  # Ищем ближайший пробел после маркера
-        if end == -1:
-            return None  # Если конец тега не найден, возвращаем ошибку
+            return None
+        end = page_source.find('"', start)
         return page_source[start:end]
     except Exception as e:
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-            '%Y-%m-%d %H:%M:%S') + "', 1,\'Error in findcase: {"+marker+"} " + e + "\')"
-        send_query_database(database_query)
-        logging.error(f"Error in findcase: {e}")
+        logging.error(f"findcase error: {e}")
         return None
 
-@retry
-def create_connection(db_name, db_user, db_password, db_host, db_port):
-    connection = None
-    try:
-        connection = psycopg2.connect(
-            database=db_name,
-            user=db_user,
-            password=db_password,
-            host=db_host,
-            port=db_port,
-        )
-        logging.error("Connection to PostgreSQL DB successful")
-    except Exception as e:
-        logging.error(f"The error '{e}' occurred")
-    return connection
 
-@retry
-def send_query_database(query):
-    #Убрать константы !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    connection = create_connection(
-        "postgres", "postgres", "2028", "localhost", "5432"
-    )
-    connection.autocommit = True
-    cursor = connection.cursor()
-    try:
-        cursor.execute(query)
-        connection.close()
-        logging.error("Query executed successfully" + query)
-    except Exception as e:
-        logging.error(f"The error '{e}' occurred")
+@retry()
+def save_items_to_db(items):
+    """Сохранение найденных объектов в БД с проверкой на дубликаты."""
+    if not items:
+        return
 
+    check_query = "SELECT apartmentsID FROM apartmentsAvito WHERE apartmentsID = %s"
+    insert_query = """
+        INSERT INTO apartmentsAvito (DateScan, name, url, price, requirement, active, apartmentsID)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
 
-@retry
-def click(self, selector, timeout=10):
-    try:
-        element = WebDriverWait(self.driver, timeout).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-        )
-        element.click()
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-            '%Y-%m-%d %H:%M:%S') + "', 1,\'Clicked element with selector: {" + selector + "}\')"
-        send_query_database(database_query)
-        logging.info(f"Clicked element with selector: {selector}")
-    except Exception as e:
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-            '%Y-%m-%d %H:%M:%S') + "', 1,\'Error clicking element with selector: {"+selector+"} " + e + "\')"
-        send_query_database(database_query)
-        logging.error(f"Error clicking element with selector {selector}: {e}")
-        raise
-
-@retry
-def sends_keys(sb, selector, keys, timeout):  # Поддержка нескольких аргументов для keys
-    try:
-        # element.clear()  # Очищаем поле перед вводом
-        for key in keys:  # Вводим каждый аргумент по очереди
-            sb.send_keys(selector,str(key),timeout=timeout)  # Преобразуем в строку
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                    '%Y-%m-%d %H:%M:%S') + "', 1,\'Sent keys {"+keys+"} to element with selector {"+selector+"}:\')"
-        send_query_database(database_query)
-        logging.info(f"Sent keys '{keys}' to element with selector: {selector}")
-
-    except Exception as e:
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                    '%Y-%m-%d %H:%M:%S') + "', 1,\'Error sending keys {"+keys+"} to element with selector {"+selector+"}: " + e + "\')"
-        send_query_database(database_query)
-        logging.error(f"Error sending keys '{keys}' to element with selector {selector}: {e}")
-        raise
-
-
-@retry
-def saveitems(titles,connection):
-    items = []
-    for title in titles:
-        try:
-            name = title.find_element(By.CSS_SELECTOR, 'a[data-marker="item-title"]').get_attribute("Title")
-            url = title.find_element(By.CSS_SELECTOR, 'a[data-marker="item-title"]').get_attribute("href")
-            price = title.find_element(By.CSS_SELECTOR, 'meta[itemprop="price"]').get_attribute("content")
-            requirement = title.find_element(By.CSS_SELECTOR, 'p[data-marker="item-specific-params"]').text
-            test1 = requirement.find("·")
-            apartmentsID = title.get_attribute("data-item-id")
-
-            item = {
-                'name': name,
-                'url': url,
-                'price': price,
-                'requirement':requirement,
-                'apartmentsID':apartmentsID,
-            }
-
-            if item not in items:
-                items.append(item)
-
-        except Exception as e:
-            database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                '%Y-%m-%d %H:%M:%S') + "', 1,\'Error extracting data from title: " + e + "\')"
-            send_query_database(database_query)
-            logging.error(f"Error extracting data from title: {e}")
-
-    try:
-        connection.autocommit = True
-        cursor = connection.cursor()
+    with db.get_cursor() as cur:
         for item in items:
-            cursor.execute("Select apartmentsID from apartmentsAvito where apartmentsID = "+item['apartmentsID']+"")
-            result = cursor.fetchall()
-            if len(result) == 0:
-                query = "INSERT INTO apartmentsAvito (DateScan,name,url,price,requirement,active,apartmentsID) VALUES ('" + dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + "', \'"+item['name']+"\',\'"+item['url']+"\',\'"+item['price']+"\',\'"+item['requirement']+"\',True,\'"+item['apartmentsID']+"\')"
-                cursor.execute(query)
-
-        #with open('result.json', 'a+', encoding="utf-8") as file:
-        #    json.dump(items, file, indent=4, ensure_ascii=False)
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                    '%Y-%m-%d %H:%M:%S') + "', 1,\'Data saved\')"
-        send_query_database(database_query)
-        #logging.info("Data saved to result.json")
-    except Exception as e:
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + "', 1,\'Error saving data: " + e + "\')"
-        send_query_database(database_query)
-        logging.error(f"Error saving data to JSON file: {e}")
-
-def read_json_file(filepath):
-    """Читает JSON-файл и возвращает его содержимое в виде Python-объекта (словаря или списка)."""
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:  # Явно указываем кодировку
-            data = json.load(f)
-        return data
-    except FileNotFoundError:
-        print(f"Ошибка: Файл не найден: {filepath}")
-        return None
-    except json.JSONDecodeError:
-        print(f"Ошибка: Некорректный JSON в файле: {filepath}")
-        return None
-    except Exception as e:
-        print(f"Произошла ошибка при чтении файла: {e}")
-        return None
+            cur.execute(check_query, (item['apartmentsID'],))
+            if not cur.fetchone():
+                cur.execute(insert_query, (
+                    dt.datetime.now(),
+                    item['name'],
+                    item['url'],
+                    item['price'],
+                    item['requirement'],
+                    True,
+                    item['apartmentsID']
+                ))
+    db.log_to_db(f"Saved {len(items)} items to database.")
 
 
-@retry
+def parse_elements(sb):
+    """Парсинг текущей страницы."""
+    items = []
+    # Используем более надежные селекторы Avito
+    listings = sb.find_elements('div[data-marker="item"]')
+
+    for listing in listings:
+        try:
+            # Используем вложенный поиск внутри элемента
+            name_el = listing.find_element(By.CSS_SELECTOR, '[data-marker="item-title"]')
+            price_el = listing.find_element(By.CSS_SELECTOR, '[itemprop="price"]')
+            req_el = listing.find_element(By.CSS_SELECTOR, '[data-marker="item-specific-params"]')
+
+            items.append({
+                'name': name_el.text,
+                'url': name_el.get_attribute("href"),
+                'price': price_el.get_attribute("content"),
+                'requirement': req_el.text,
+                'apartmentsID': listing.get_attribute("data-item-id")
+            })
+        except Exception:
+            continue  # Пропускаем битые элементы
+    return items
+
+
 def collect_data_apartments():
+    """Основная логика скрапинга."""
     try:
-        ua = UserAgent(platforms='pc')
-        with SB(uc=True, headless=False) as sb:  #  headless=False для видимости
-            connection = create_connection(
-                "postgres", "postgres", "2028", "localhost", "5432"
-            )
-            sb.open("https://www.avito.ru/sankt-peterburg/kvartiry/sdam/na_dlitelnyy_srok?metro=171-181&s=104")
+        # uc=True включает Anti-bot обход
+        with SB(uc=True, headless=False) as sb:
+            url = "https://www.avito.ru/sankt-peterburg/kvartiry/sdam/na_dlitelnyy_srok?metro=171-181&s=104"
+            sb.open(url)
 
-            nameMainFilter = findcase(sb.get_page_source(), "form-mainFilters")
-            if nameMainFilter:
-                sb.click(
-                    "div." + nameMainFilter + " > form > div:nth-of-type(3) > div:nth-of-type(2) > div > div:nth-of-type(2) > div > label")  # form-mainFilters-y0xZT
-            else:
-                database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                    '%Y-%m-%d %H:%M:%S') + "', 1,\' Could not find main filter element.\')"
-                send_query_database(database_query)
-                #logging.warning("Could not find main filter element.")
+            # Обход "Main Filter" (если нужно)
+            main_filter_class = extract_case(sb.get_page_source(), "form-mainFilters")
+            if main_filter_class:
+                selector = f"div.{main_filter_class} label"
+                if sb.is_element_visible(selector):
+                    sb.click(selector)
 
-            element = sb.wait_for_element('input[data-marker="price-to/input"]', timeout=10)
+            # Нажимаем кнопку поиска
+            if sb.is_element_visible('button[data-marker="search-filters/submit-button"]'):
+                sb.click('button[data-marker="search-filters/submit-button"]')
+                sb.sleep(2)
 
-            #Фильтры
-            if element:
-                #sends_keys(sb,'input[data-marker="price-to/input"]',"60000",timeout=10)  # Отправляем все цифры сразу
-                sb.click('button[data-marker="search-filters/submit-button"]', timeout=10)
-            else:
-                database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                    '%Y-%m-%d %H:%M:%S') + "', 1,\' Could not find price input element.\')"
-                send_query_database(database_query)
-                #logging.warning("Could not find price input element.")
+            # Цикл по страницам пагинации
+            page = 1
+            while page <= 5:  # Ограничим для примера 5 страницами
+                logging.info(f"Parsing page {page}")
+                items = parse_elements(sb)
+                if items:
+                    save_items_to_db(items)
 
-            spisok = sb.find_elements(By.CSS_SELECTOR,'div[data-marker="item"]')
-            if len(spisok)>0:
-                titles = sb.find_elements(By.CSS_SELECTOR,'div[data-marker="item"]')
-                saveitems(titles,connection)
-            else:
-                return "Not find elements"
-
-            try:
-                #Переход на след.страницу
-                while len(sb.find_elements('a[data-marker="pagination-button/nextPage"]') )> 0:
-                    sb.click('a[data-marker="pagination-button/nextPage"]')
-                    spisoksssecond = sb.find_elements(By.CSS_SELECTOR, 'div[data-marker="item"]')
-                    if len(spisoksssecond) > 0:
-                        newtitles = sb.find_elements(By.CSS_SELECTOR,'div[data-marker="item"]')
-                        saveitems(newtitles,connection)
-
-            except Exception as e:
-                database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-                    '%Y-%m-%d %H:%M:%S') + "', 1,\'Error saving data:" + e + "\')"
-                send_query_database(database_query)
-
-                logging.error(f"Error saving data to JSON file: {e}")
-            connection.close()
+                # Переход на следующую страницу
+                next_button = 'a[data-marker="pagination-button/nextPage"]'
+                if sb.is_element_visible(next_button):
+                    sb.click(next_button)
+                    sb.sleep(3)  # Важно давать паузу
+                    page += 1
+                else:
+                    break
 
     except Exception as e:
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-            '%Y-%m-%d %H:%M:%S') + "', 1,\'Critical error in collect_data: "+ e +"\')"
-        send_query_database(database_query)
+        logging.critical(f"Scraper crashed: {e}")
+        db.log_to_db(f"CRITICAL ERROR: {str(e)}")
 
-        logging.critical(f"Critical error in collect_data: {e}")
-        return [] # Возвращаем пустой список, чтобы не сломать логику
 
-    return 0
-
-# Пример использования
 if __name__ == '__main__':
-    database_query = "INSERT INTO history (Date,Users) VALUES ('" + dt.datetime.now().strftime(
-        '%Y-%m-%d %H:%M:%S') + "', 1)"
-    send_query_database(database_query)
-    collected_items = collect_data_apartments()
-    if collected_items == "Not find elements":
-        database_query = "INSERT INTO logs (Date,Users,Messages) VALUES ('" + dt.datetime.now().strftime(
-            '%Y-%m-%d %H:%M:%S') + "', 1,\'not find element\')"
-        send_query_database(database_query)
+    # Запись начала работы
+    db = DatabaseManager(DB_CONFIG)
+    with db.get_cursor() as cursor:
+        cursor.execute("INSERT INTO history (Date, Users) VALUES (%s, %s)", (dt.datetime.now(), 1))
+
+    collect_data_apartments()
